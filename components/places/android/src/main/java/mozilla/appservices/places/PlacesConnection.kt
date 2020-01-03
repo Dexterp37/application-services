@@ -17,6 +17,18 @@ import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.lang.ref.WeakReference
+import org.mozilla.appservices.places.GleanMetrics.PlacesManager as PlacesManagerMetrics
+
+/**
+ * Import some private Glean types, so that we can use them in type declarations.
+ *
+ * By agreement with the Glean team, we must not
+ * instantiate anything from these classes, and it's on us to fix any bustage
+ * on version updates.
+ */
+import mozilla.components.service.glean.private.CounterMetricType
+import mozilla.components.service.glean.private.TimingDistributionMetricType
+import mozilla.components.service.glean.private.LabeledMetricType
 
 /**
  * An implementation of a [PlacesManager] backed by a Rust Places library.
@@ -259,14 +271,18 @@ open class PlacesReaderConnection internal constructor(connHandle: Long) :
         val urlStrings = StringArray(urls.toTypedArray(), "utf8")
         val byteBuffer = ByteBuffer.allocateDirect(urls.size)
         byteBuffer.order(ByteOrder.nativeOrder())
-        rustCall { error ->
-            val bufferPtr = Native.getDirectBufferPointer(byteBuffer)
-            LibPlacesFFI.INSTANCE.places_get_visited(
-                    this.handle.get(),
-                    urlStrings, urls.size,
-                    bufferPtr, urls.size,
-                    error
-            )
+        PlacesManagerMetrics.readQueryTime.measure {
+            rustCall { error ->
+                val bufferPtr = Native.getDirectBufferPointer(byteBuffer)
+                PlacesManagerMetrics.readQueryTime.measure {
+                    LibPlacesFFI.INSTANCE.places_get_visited(
+                            this.handle.get(),
+                            urlStrings, urls.size,
+                            bufferPtr, urls.size,
+                            error
+                    )
+                }
+            }
         }
         val result = ArrayList<Boolean>(urls.size)
         for (index in 0 until urls.size) {
@@ -295,15 +311,19 @@ open class PlacesReaderConnection internal constructor(connHandle: Long) :
     }
 
     override fun getVisitInfos(start: Long, end: Long, excludeTypes: List<VisitType>): List<VisitInfo> {
-        val infoBuffer = rustCall { error ->
-            LibPlacesFFI.INSTANCE.places_get_visit_infos(
-                    this.handle.get(), start, end, visitTransitionSet(excludeTypes), error)
-        }
-        try {
-            val infos = MsgTypes.HistoryVisitInfos.parseFrom(infoBuffer.asCodedInputStream()!!)
-            return VisitInfo.fromMessage(infos)
-        } finally {
-            LibPlacesFFI.INSTANCE.places_destroy_bytebuffer(infoBuffer)
+        return readQueryCounters.measure {
+            val infoBuffer = rustCall { error ->
+                PlacesManagerMetrics.readQueryTime.measure {
+                    LibPlacesFFI.INSTANCE.places_get_visit_infos(
+                            this.handle.get(), start, end, visitTransitionSet(excludeTypes), error)
+                }
+            }
+            try {
+                val infos = MsgTypes.HistoryVisitInfos.parseFrom(infoBuffer.asCodedInputStream()!!)
+                return VisitInfo.fromMessage(infos)
+            } finally {
+                LibPlacesFFI.INSTANCE.places_destroy_bytebuffer(infoBuffer)
+            }
         }
     }
 
@@ -419,6 +439,13 @@ open class PlacesReaderConnection internal constructor(connHandle: Long) :
             LibPlacesFFI.INSTANCE.places_destroy_bytebuffer(rustBuf)
         }
     }
+
+    private val readQueryCounters: PlacesManagerCounterMetrics by lazy {
+        PlacesManagerCounterMetrics(
+            PlacesManagerMetrics.readQueryCount,
+            PlacesManagerMetrics.readQueryErrorCount
+        )
+    }
 }
 
 fun visitTransitionSet(l: List<VisitType>): Int {
@@ -449,16 +476,24 @@ class PlacesWriterConnection internal constructor(connHandle: Long, api: PlacesA
     }
 
     override fun deletePlace(url: String) {
-        rustCall { error ->
-            LibPlacesFFI.INSTANCE.places_delete_place(
-                    this.handle.get(), url, error)
+        return writeCounters.measure {
+            rustCall { error ->
+                PlacesManagerMetrics.writeQueryTime.measure {
+                    LibPlacesFFI.INSTANCE.places_delete_place(
+                        this.handle.get(), url, error)
+                }
+            }
         }
     }
 
     override fun deleteVisit(url: String, visitTimestamp: Long) {
-        rustCall { error ->
-            LibPlacesFFI.INSTANCE.places_delete_visit(
-                    this.handle.get(), url, visitTimestamp, error)
+        return writeCounters.measure {
+            rustCall { error ->
+                PlacesManagerMetrics.writeQueryTime.measure {
+                    LibPlacesFFI.INSTANCE.places_delete_visit(
+                            this.handle.get(), url, visitTimestamp, error)
+                }
+            }
         }
     }
 
@@ -467,9 +502,13 @@ class PlacesWriterConnection internal constructor(connHandle: Long, api: PlacesA
     }
 
     override fun deleteVisitsBetween(startTime: Long, endTime: Long) {
-        rustCall { error ->
-            LibPlacesFFI.INSTANCE.places_delete_visits_between(
-                    this.handle.get(), startTime, endTime, error)
+        return writeCounters.measure {
+            rustCall { error ->
+                PlacesManagerMetrics.writeQueryTime.measure {
+                    LibPlacesFFI.INSTANCE.places_delete_visits_between(
+                        this.handle.get(), startTime, endTime, error)
+                }
+            }
         }
     }
 
@@ -492,8 +531,12 @@ class PlacesWriterConnection internal constructor(connHandle: Long, api: PlacesA
     }
 
     override fun deleteEverything() {
-        rustCall { error ->
-            LibPlacesFFI.INSTANCE.places_delete_everything(this.handle.get(), error)
+        return writeCounters.measure {
+            rustCall { error ->
+                PlacesManagerMetrics.writeQueryTime.measure {
+                    LibPlacesFFI.INSTANCE.places_delete_everything(this.handle.get(), error)
+                }
+            }
         }
     }
 
@@ -577,6 +620,13 @@ class PlacesWriterConnection internal constructor(connHandle: Long, api: PlacesA
         val handle = this.handle.getAndSet(0L)
         interruptHandle.close()
         return handle
+    }
+
+    private val writeQueryCounters: PlacesManagerCounterMetrics by lazy {
+        PlacesManagerCounterMetrics(
+            PlacesManagerMetrics.writeQueryCount,
+            PlacesManagerMetrics.writeQueryErrorCount
+        )
     }
 }
 
@@ -1076,6 +1126,63 @@ data class VisitInfosWithBound(
                 bound = msg.bound,
                 offset = msg.offset
             )
+        }
+    }
+}
+
+/**
+ * A helper extension method for conveniently measuring execution time of a closure.
+ *
+ * N.B. since we're measuring calls to Rust code here, the provided callback may be doing
+ * unsafe things. It's very imporant that we always call the function exactly once here
+ * and don't try to do anything tricky like stashing it for later or calling it multiple times.
+ */
+inline fun <U> TimingDistributionMetricType.measure(funcToMeasure: () -> U): U {
+    val timerId = this.start()
+    try {
+        return funcToMeasure()
+    } finally {
+        this.stopAndAccumulate(timerId)
+    }
+}
+
+/**
+ * A helper class for gathering basic count metrics on different kinds of PlacesManager operations.
+ *
+ * For each type of operation, we want to measure:
+ *    - total count of operations performed
+ *    - count of operations that produced an error, labeled by type
+ *
+ * This is a convenince wrapper to measure the two in one shot.
+ */
+ class PlacesManagerCounterMetrics(
+    val count: CounterMetricType,
+    val errCount: LabeledMetricType<CounterMetricType>
+) {
+    @Suppress("ComplexMethod", "TooGenericExceptionCaught")
+    inline fun <U> measure(callback: () -> U): U {
+        count.add()
+        try {
+            return callback()
+        } catch (e: Exception) {
+            when (e) {
+                is NoSuchRecordException -> {
+                    errCount["no_such_recod"].add()
+                }
+                is IdCollisionException -> {
+                    errCount["id_collision"].add()
+                }
+                is InvalidKeyException -> {
+                    errCount["invalid_key"].add()
+                }
+                is InterruptedException -> {
+                    errCount["interrupted"].add()
+                }
+                else -> {
+                    errCount["__other__"].add()
+                }
+            }
+            throw e
         }
     }
 }
